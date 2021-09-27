@@ -1,0 +1,68 @@
+name: Build VC Project
+
+on:
+  push:
+    #tags:
+    #  - 'v*'
+
+    #branches: [ master ]
+  release:
+    types:
+      - created
+  workflow_dispatch:
+    inputs:
+      debug_enabled:
+        required: false
+        default: ''
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+    - name: Check out repository
+      uses: actions/checkout@v2.3.4
+    - name: Setup MSBuild.exe
+      uses: microsoft/setup-msbuild@v1.0.2
+    - name: Grab or Build Vcpkg Deps
+      uses: lukka/run-vcpkg@v5
+      with:
+        vcpkgGitCommitId: 5568f110b509a9fd90711978a7cb76bae75bb092
+        vcpkgTriplet: x64-windows
+        vcpkgArguments: '@${{ github.workspace }}/vcpkg-deps.txt'
+        vcpkgDirectory: '${{ github.workspace }}/vcpkg'
+        appendedCacheKey: ${{ hashFiles('vcpkg-deps.txt') }}
+    - name: Install MSBuild integration
+      shell: powershell
+      run: vcpkg integrate install
+
+    - name: Setup tmate session
+      uses: mxschmitt/action-tmate@v3
+      if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.debug_enabled }}
+
+
+    # Handle Debug Building...
+    - name: Build Debug package
+      if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+      run: msbuild /p:Configuration=Debug_NoCopy /p:Platform=x64
+    - name: Upload Artifact
+      if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+      uses: actions/upload-artifact@v2
+      with:
+        name: VERSION.dll
+        path: ${{ github.workspace }}/build_output/VERSION.dll
+          
+
+    # Handle Release Building...
+    - name: Get Tag
+      if: ${{ startsWith(github.ref, 'refs/tags/') }}
+      id: tag
+      uses: dawidd6/action-get-tag@v1    
+    - name: Build Release package
+      if: ${{ startsWith(github.ref, 'refs/tags/') }}
+      run: msbuild /p:Configuration=Release /p:Platform=x64
+    - name: Release
+      uses: softprops/action-gh-release@v1
+      if: ${{ startsWith(github.ref, 'refs/tags/') }}
+      with:
+        files: ${{ github.workspace }}/build_output/VERSION.dll
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
