@@ -28,5 +28,8 @@
     <ClInclude Include="src\dbg.h">
       <Filter>Hooker</Filter>
     </ClInclude>
+    <ClInclude Include="src\LRUCache.hpp">
+      <Filter>Hooker</Filter>
+    </ClInclude>
   </ItemGroup>
 </Project>

@@ -22,8 +22,10 @@
 #include "MINT.h"
 #include "win_handle.h"
 #include "dbg.h"
+#include "LRUCache.hpp"
 
 decltype(&ReadDirectoryChangesW) pReadDirectoryChangesW;
+decltype(&ReadDirectoryChangesExW) pReadDirectoryChangesExW;
 decltype(&CreateIoCompletionPort) pCreateIoCompletionPort;
 
 
@@ -54,6 +56,7 @@ struct OverlapSymlinkContext {
 	std::string relaPath;
 	std::vector<char> retBuffer;
 	DWORD notifyFlags;
+	READ_DIRECTORY_NOTIFY_INFORMATION_CLASS notifyClass;
 	scoped_win_handle h;
 	scoped_win_handle hOvlEvt;
 	OVERLAPPED ovl;
@@ -84,14 +87,23 @@ struct OverlapSymlinkContext {
 		wassert(*h != NULL);
 	}
 
-	BOOL readChangeStart(DWORD notifyFlags, DWORD bufferLen) {
+	BOOL readChangeStart(DWORD notifyFlags, DWORD bufferLen, READ_DIRECTORY_NOTIFY_INFORMATION_CLASS notifyClass) {
 		retBuffer.resize(bufferLen);
 		this->notifyFlags = notifyFlags;
-
+		this->notifyClass = notifyClass;
 		
-		BOOL success = pReadDirectoryChangesW(
-			h->get(), retBuffer.data(), (DWORD)retBuffer.size(), TRUE, notifyFlags, // 11f
-			NULL, &ovl, NULL);
+		BOOL success = FALSE;
+		if (notifyClass != (READ_DIRECTORY_NOTIFY_INFORMATION_CLASS)-1) {
+			success = pReadDirectoryChangesExW(
+				h->get(), retBuffer.data(), (DWORD)retBuffer.size(), TRUE, notifyFlags, // 11f
+				NULL, &ovl, NULL, notifyClass);
+		}
+		else {
+			success = pReadDirectoryChangesW(
+				h->get(), retBuffer.data(), (DWORD)retBuffer.size(), TRUE, notifyFlags, // 11f
+				NULL, &ovl, NULL);
+		}
+		
 		return success;
 	}
 
@@ -107,7 +119,7 @@ struct SymlinkGroup {
 
 	SymlinkGroup() : last_updated(0) {}
 
-	std::vector<char> getChanges(DWORD nBufferLength, LPDWORD status) {
+	std::vector<char> getChanges(DWORD nBufferLength, READ_DIRECTORY_NOTIFY_INFORMATION_CLASS notifyClass, LPDWORD status) {
 		BOOL bRet = TRUE;
 		auto symlinks = contexts;
 		std::map<std::string, OverlapSymlinkContext > retBufferMap;
@@ -118,7 +130,8 @@ struct SymlinkGroup {
 		for (auto& it : symlinks) {
 			bRet = it.second.readChangeStart(
 				FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_ATTRIBUTES | FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SECURITY,
-				nBufferLength / 2
+				nBufferLength / 2,
+				notifyClass
 			);
 			wassert(bRet);
 			hEvents.push_back(it.second.ovl.hEvent);
@@ -181,19 +194,33 @@ struct SymlinkGroup {
 
 
 std::map<std::string, SymlinkGroup> handleContexts;
-std::map<HANDLE, FILE_COMPLETION_INFORMATION> onedriveIocp;
+//std::map<HANDLE, FILE_COMPLETION_INFORMATION> onedriveIocp;
+lru::Cache<HANDLE, FILE_COMPLETION_INFORMATION> onedriveIocp;
 
+BOOL FileExists(LPCTSTR szPath)
+{
+	DWORD dwAttrib = GetFileAttributes(szPath);
 
-void updateSymlinkList(HANDLE hDirectory) {
+	return (dwAttrib != INVALID_FILE_ATTRIBUTES &&
+		!(dwAttrib & FILE_ATTRIBUTE_DIRECTORY));
+}
+
+BOOL updateSymlinkList(HANDLE hDirectory) {
 	std::string _path = get_handle_path(hDirectory);
+	std::string _symlinkConf = _path + "\\symlinks.ini";
 	if (handleContexts.contains(_path)) {
 		if (time(NULL) - handleContexts[_path].last_updated < 30) {
-			return;
+			return TRUE;
 		}
 		dbg("Symlink List too old, re-construsting...");
 	}
 	else {
+		if (!FileExists(_symlinkConf.c_str())) {
+			dbg("path %s has no symlink.ini, returning!", _symlinkConf.c_str());
+			return FALSE;
+		}
 		dbg("Symlink List not exists, construsting...");
+		
 		handleContexts[_path] = SymlinkGroup();
 	}
 	handleContexts[_path].last_updated = time(NULL);
@@ -202,7 +229,7 @@ void updateSymlinkList(HANDLE hDirectory) {
 	symlinks.clear();
 	symlinks[_path] = std::move(OverlapSymlinkContext(_path, ""));
 
-	std::ifstream file(_path + "\\symlinks.ini");
+	std::ifstream file(_symlinkConf);
 	if (file.is_open()) {
 		std::string line;
 		while (std::getline(file, line)) {
@@ -219,6 +246,7 @@ void updateSymlinkList(HANDLE hDirectory) {
 		}
 		file.close();
 	}
+	return TRUE;
 }
 
 HANDLE hook_CreateIoCompletionPort(
@@ -240,13 +268,13 @@ HANDLE hook_CreateIoCompletionPort(
 	RtlInitUnicodeString(&strFile, L"File");
 	if (RtlEqualUnicodeString(&oti[0].TypeName, &strFile, FALSE)) {
 		if (get_handle_path(FileHandle, TRUE).ends_with("OneDrive")) {
-			onedriveIocp[FileHandle] = { hRet, (PVOID)CompletionKey };
+			onedriveIocp.insert(FileHandle, { hRet, (PVOID)CompletionKey });
 		}
 	}
 	return hRet;
 }
 
-BOOL hook_ReadDirectoryChangesW(
+BOOL handle_ReadDirectoryChanges(
 	HANDLE                          hDirectory,
 	LPVOID                          lpBuffer,
 	DWORD                           nBufferLength,
@@ -254,19 +282,27 @@ BOOL hook_ReadDirectoryChangesW(
 	DWORD                           dwNotifyFilter,
 	LPDWORD                         lpBytesReturned,
 	LPOVERLAPPED                    lpOverlapped,
-	LPOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine
+	LPOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine,
+	READ_DIRECTORY_NOTIFY_INFORMATION_CLASS ReadDirectoryNotifyInformationClass
 ) {
-	dbg("Entered hook_ReadDirectoryChangesW!");
+	dbg("Entered handle_ReadDirectoryChanges!");
 	BOOL bRet = TRUE;
 	dbg("Updating symlinkList!");
-	updateSymlinkList(hDirectory);
+	if (!updateSymlinkList(hDirectory)) {
+		if (ReadDirectoryNotifyInformationClass != (READ_DIRECTORY_NOTIFY_INFORMATION_CLASS)-1) {
+			return pReadDirectoryChangesExW(hDirectory, lpBuffer, nBufferLength, bWatchSubtree, dwNotifyFilter, lpBytesReturned, lpOverlapped, lpCompletionRoutine, ReadDirectoryNotifyInformation);
+		}
+		else {
+			return pReadDirectoryChangesW(hDirectory, lpBuffer, nBufferLength, bWatchSubtree, dwNotifyFilter, lpBytesReturned, lpOverlapped, lpCompletionRoutine);
+		}
+	}
 	
 	std::string _path = get_handle_path(hDirectory);
 	dbg("handlePath: %s", _path.c_str());
 
 	auto handler = [=](BOOL isIOCP) {
 		DWORD handleStatus = 0;
-		auto retBuffer = handleContexts[_path].getChanges(nBufferLength, &handleStatus);
+		auto retBuffer = handleContexts[_path].getChanges(nBufferLength, ReadDirectoryNotifyInformationClass, &handleStatus);
 		memcpy(lpBuffer, retBuffer.data(), retBuffer.size());
 		if (isIOCP && handleStatus == 0) {
 			if (onedriveIocp.contains(hDirectory)) {
@@ -289,16 +325,54 @@ BOOL hook_ReadDirectoryChangesW(
 	return TRUE;
 }
 
+BOOL hook_ReadDirectoryChangesW(
+	HANDLE                          hDirectory,
+	LPVOID                          lpBuffer,
+	DWORD                           nBufferLength,
+	BOOL                            bWatchSubtree,
+	DWORD                           dwNotifyFilter,
+	LPDWORD                         lpBytesReturned,
+	LPOVERLAPPED                    lpOverlapped,
+	LPOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine
+) {
+	return handle_ReadDirectoryChanges(hDirectory, lpBuffer, nBufferLength, bWatchSubtree, dwNotifyFilter, lpBytesReturned, lpOverlapped, lpCompletionRoutine, (READ_DIRECTORY_NOTIFY_INFORMATION_CLASS)-1);
+}
+
+BOOL hook_ReadDirectoryChangesExW(
+	HANDLE                          hDirectory,
+	LPVOID                          lpBuffer,
+	DWORD                           nBufferLength,
+	BOOL                            bWatchSubtree,
+	DWORD                           dwNotifyFilter,
+	LPDWORD                         lpBytesReturned,
+	LPOVERLAPPED                    lpOverlapped,
+	LPOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine,
+	READ_DIRECTORY_NOTIFY_INFORMATION_CLASS ReadDirectoryNotifyInformationClass
+) {
+	return handle_ReadDirectoryChanges(hDirectory, lpBuffer, nBufferLength, bWatchSubtree, dwNotifyFilter, lpBytesReturned, lpOverlapped, lpCompletionRoutine, ReadDirectoryNotifyInformation);
+}
+
 bool hook() {
-	*(void**)&pCreateIoCompletionPort = GetProcAddress(LoadLibraryA("kernel32"), "CreateIoCompletionPort");
-	*(void **)&pReadDirectoryChangesW = GetProcAddress(LoadLibraryA("kernel32"), "ReadDirectoryChangesW");
+	*(void **)&pReadDirectoryChangesW = GetProcAddress(LoadLibraryA("kernelbase"), "ReadDirectoryChangesW");
+	dbg("got pReadDirectoryChangesW: %p", pReadDirectoryChangesW);
+	*(void**)&pReadDirectoryChangesExW = GetProcAddress(LoadLibraryA("kernelbase"), "ReadDirectoryChangesExW");
+	dbg("got pReadDirectoryChangesExW: %p", pReadDirectoryChangesExW);
+	*(void**)&pCreateIoCompletionPort = GetProcAddress(LoadLibraryA("kernelbase"), "CreateIoCompletionPort");
+	dbg("got pCreateIoCompletionPort: %p", pCreateIoCompletionPort);
 	LONG ret = 0;
 	DetourRestoreAfterWith();
+	DetourSetIgnoreTooSmall(TRUE);
 	DetourTransactionBegin();
 	ret = DetourUpdateThread(GetCurrentThread());
+	dbg("got DetourUpdateThread: %d", ret);
 	ret = DetourAttach(&(LPVOID&)pReadDirectoryChangesW, hook_ReadDirectoryChangesW);
+	dbg("got DetourAttach1: %d", ret);
+	ret = DetourAttach(&(LPVOID&)pReadDirectoryChangesExW, hook_ReadDirectoryChangesExW);
+	dbg("got DetourAttach2: %d", ret);
 	ret = DetourAttach(&(LPVOID&)pCreateIoCompletionPort, hook_CreateIoCompletionPort);
+	dbg("got DetourAttach3: %d", ret);
 	ret = DetourTransactionCommit();
+	dbg("got DetourTransactionCommit: %d", ret);
 	return ret == NO_ERROR;
 }
 
@@ -317,6 +391,6 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD  ul_reason_for_call, LPVOID lpReser
 		OutputDebugStringA("OneDriveSymLink Hook Failed!");
 		return FALSE;
 	}
-	OutputDebugStringA("AppraiserHijack Hook Success!");
+	OutputDebugStringA("OneDriveSymLink Hook Success!");
 	return TRUE;
 }
