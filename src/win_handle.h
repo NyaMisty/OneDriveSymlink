@@ -28,6 +28,7 @@ public:
 	}
 
 private:
+	friend struct win_handle_deleter;
 	HANDLE handle_ = nullptr;
 };
 
@@ -35,7 +36,8 @@ struct win_handle_deleter {
 	using pointer = win_handle;
 
 	void operator()(pointer ptr) const {
-		CloseHandle(ptr);
+		dbg("destroying handle!");
+		CloseHandle(ptr.handle_);
 	}
 };
 

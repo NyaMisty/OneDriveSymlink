@@ -1,6 +1,6 @@
 #define dbg(format, ...) ShowDebugBase(TEXT("FUNC: %s()  MSG: ") TEXT(format), TEXT(__FUNCTION__), ##__VA_ARGS__)
 
-inline void ShowDebugBase(const TCHAR* format, ...)
+inline void ShowDebugBase(const char* format, ...)
 {
 	va_list args;
 	SYSTEMTIME time;
@@ -10,10 +10,10 @@ inline void ShowDebugBase(const TCHAR* format, ...)
 	GetLocalTime(&time);
 
 	va_start(args, format);
-	_vstprintf_s(tempBuf, format, args);
-	_stprintf_s(msgBuf, TEXT("***DEBUG***  TIME: %02d:%02d:%02d.%03d  %s\n"), time.wHour, time.wMinute, time.wSecond, time.wMilliseconds, tempBuf);
+	vsprintf_s(tempBuf, format, args);
+	sprintf_s(msgBuf, TEXT("***DEBUG***  TIME: %02d:%02d:%02d.%03d  %s\n"), time.wHour, time.wMinute, time.wSecond, time.wMilliseconds, tempBuf);
 
-	OutputDebugString(msgBuf);
+	OutputDebugStringA(msgBuf);
 	va_end(args);
 }
 
